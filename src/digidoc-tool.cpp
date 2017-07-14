@@ -355,7 +355,7 @@ static void printUsage(const char *executable)
 struct Params
 {
     Params(int argc, char *argv[]);
-    string path, profile, pkcs11, pkcs12, pin, city, street, state, postalCode, country, cert;
+    string path, profile, pkcs11, pkcs12, pin, digest, city, street, state, postalCode, country, cert;
     vector<pair<string,string> > files;
     vector<string> roles;
     bool cng = true, selectFirst = false, doSign = true, dontValidate = false, XAdESEN = false;
@@ -416,6 +416,7 @@ Params::Params(int argc, char *argv[])
         }
         else if(arg == "--dontValidate") dontValidate = true;
         else if(arg == "--XAdESEN") XAdESEN = true;
+        else if(arg.find("--digest=") == 0) digest = arg.substr(7); // Priit
         else if(arg.find("--pin=") == 0) pin = arg.substr(6);
         else if(arg.find("--cert=") == 0) cert = arg.substr(7);
         else if(arg.find("--city=") == 0) city = arg.substr(7);
@@ -650,6 +651,8 @@ static int open(int argc, char* argv[])
 
     return returnCode;
 }
+
+
 
 /**
  * Remove items from container.
@@ -985,6 +988,130 @@ static int websign(int argc, char* argv[])
     return returnCode;
 }
 
+static int startWebsign(int argc, char* argv[])
+{
+    Params p(argc, argv);
+    if(p.path.empty())
+    {
+        printUsage(argv[0]);
+        return EXIT_FAILURE;
+    }
+
+    unique_ptr<Container> doc;
+    try {
+        doc.reset(Container::create(p.path));
+    } catch(const Exception &e) {
+        printf("Failed to parse container");
+        parseException(e, "  Exception:");
+        return EXIT_FAILURE;
+    }
+
+    int returnCode = EXIT_SUCCESS;
+    try {
+        for(const pair<string,string> &file: p.files)
+            doc->addDataFile(file.first, file.second);
+
+        unique_ptr<Signer> signer(new WebSigner(X509Cert(p.cert, X509Cert::Pem)));
+        signer->setENProfile(p.XAdESEN);
+        signer->setSignatureProductionPlaceV2(p.city, p.street, p.state, p.postalCode, p.country);
+        signer->setSignerRoles(p.roles);
+        signer->setProfile(p.profile);
+
+        Signature *signature = doc->prepareSignature(signer.get());
+        cout << "Signature method: " << signature->signatureMethod() << endl;
+        cout << "Digest to sign:   " << signature->dataToSign() << endl;
+
+        doc->save();
+    } catch(const Exception &e) {
+        parseException(e, "Caught Exception:");
+        returnCode = EXIT_FAILURE;
+    }
+
+    return returnCode;
+}
+
+static int endWebsign(int argc, char* argv[])
+{
+    enum {
+        WError,
+        WWarning,
+        WIgnore
+    } reportwarnings = WWarning;
+    string path, extractPath, policy;
+    int returnCode = EXIT_SUCCESS;
+
+    Params p(argc, argv);
+    if(p.digest.empty())
+    {
+        printf("Provide signed digest. Example: --digest=123");
+        return EXIT_FAILURE;
+    }
+
+    // Parse command line arguments.
+    for(int i = 2; i < argc; i++)
+    {
+        string arg( decodeParameter( argv[i] ) );
+        if(arg == "--list")
+            continue;
+        else if(arg.find("--warnings=") == 0)
+        {
+            if(arg.substr(11, 6) == "ignore") reportwarnings = WIgnore;
+            if(arg.substr(11, 5) == "error") reportwarnings = WError;
+        }
+        else if(arg.find("--extractAll") == 0)
+        {
+            extractPath = ".";
+            size_t pos = arg.find("=");
+            if(pos != string::npos)
+                extractPath = arg.substr(pos + 1);
+        }
+        else if(arg.find("--policy=") == 0)
+            policy = arg.substr(9);
+        else
+            path = arg;
+    }
+
+    if(path.empty())
+    {
+        printUsage(argv[0]);
+        return EXIT_FAILURE;
+    }
+
+    unique_ptr<Container> doc;
+    try {
+        doc.reset(Container::open(path));
+    } catch(const Exception &e) {
+        cout << "Failed to parse container";
+        parseException(e, "  Exception:");
+        return EXIT_FAILURE;
+    }
+
+    try {
+        for(Signature *signature: doc->signatures())
+        {
+          signature->setSignatureValue(File::hexToBin(p.digest));
+          signature->extendSignatureProfile(p.profile);
+          try {
+              signature->validate();
+              cout << "    Validation: " << Params::GREEN << "OK" << Params::RESET << endl;
+          } catch(const Exception &e) {
+              cout << "    Validation: " << Params::RED << "FAILED" << Params::RESET << endl;
+              parseException(e, "     Exception:");
+              returnCode = EXIT_FAILURE;
+          }
+        }
+        doc->save();
+    } catch(const Exception &e) {
+        parseException(e, "Caught Exception:");
+        returnCode = EXIT_FAILURE;
+    }
+
+    return returnCode;
+}
+
+
+
+
 static int tslcmd(int , char* [])
 {
     int returnCode = EXIT_SUCCESS;
@@ -1099,6 +1226,10 @@ int main(int argc, char *argv[])
         returnCode = sign(argc, argv);
     else if(command == "websign")
         returnCode = websign(argc, argv);
+    else if(command == "startWebsign")
+        returnCode = startWebsign(argc, argv);
+    else if(command == "endWebsign")
+        returnCode = endWebsign(argc, argv);
     else if(command == "tsl")
         returnCode = tslcmd(argc, argv);
     else if(command == "version")
